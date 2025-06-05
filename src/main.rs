@@ -66,7 +66,7 @@ enum Commands {
 }
 
 #[derive(Debug)]
-pub enum KubeCfgError {
+pub enum KubeConfError {
     MergeError(String),
 }
 
@@ -75,7 +75,7 @@ fn merge_kubeconfigs(
     other: KubeConfig,
     force: bool,
     include_preferences: bool,
-) -> Result<KubeConfig, KubeCfgError> {
+) -> Result<KubeConfig, KubeConfError> {
     let mut main = main;
 
     // Merge preferences
