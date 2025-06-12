@@ -1,8 +1,11 @@
 use clap::{Parser, Subcommand};
-use std::env::home_dir;
+use std::{env::home_dir, thread::current, vec};
 mod kubeconfig;
 use crate::kubeconfig::{KubeConfig, Preferences};
 use log::{info, warn};
+use std::fs;
+use colored::Colorize;
+use tabled::{settings::{object::{Columns, Rows}, Color, Margin, Padding, Style}, Table, Tabled};
 
 fn default_kubeconfig_path() -> std::path::PathBuf {
     let p = home_dir().unwrap();
@@ -70,6 +73,12 @@ pub enum KubeConfError {
     MergeError(String),
 }
 
+#[derive(Tabled)]
+struct PrettyPrintedContextNamespace {
+    CONTEXT: String,
+    NAMESPACE: String,
+}
+
 fn merge_kubeconfigs(
     main: KubeConfig,
     other: KubeConfig,
@@ -91,7 +100,10 @@ fn merge_kubeconfigs(
                         match main_preferences.colors {
                             Some(colors) => {
                                 if force {
-                                    warn!("Merging preferences colors value to `{:?}` even though main had it set to `{}` because of --force flag.", other_preferences.colors, colors);
+                                    warn!(
+                                        "Merging preferences colors value to `{:?}` even though main had it set to `{}` because of --force flag.",
+                                        other_preferences.colors, colors
+                                    );
                                     // If force, take the value from other.
                                     merged_preferences.colors = other_preferences.colors;
                                 } else {
@@ -116,7 +128,10 @@ fn merge_kubeconfigs(
                                 existing_extensions_index
                             {
                                 if force {
-                                    warn!("Overriding preferences extension with name {} because of --force flag.", other_extension.name);
+                                    warn!(
+                                        "Overriding preferences extension with name {} because of --force flag.",
+                                        other_extension.name
+                                    );
                                     merged_extensions[existing_extensions_index] = other_extension;
                                 }
                             }
@@ -131,8 +146,8 @@ fn merge_kubeconfigs(
                         main.preferences = Some(other_preferences);
                     }
                 }
-            }
-            None => {}
+            },
+            None => {},
         }
     }
 
@@ -146,7 +161,10 @@ fn merge_kubeconfigs(
             merged_clusters.push(other_cluster);
         } else if let Some(existing_clusters_index) = existing_clusters_index {
             if force {
-                warn!("Overriding cluster with name {} because of --force flag.", other_cluster.name);
+                warn!(
+                    "Overriding cluster with name {} because of --force flag.",
+                    other_cluster.name
+                );
                 merged_clusters[existing_clusters_index] = other_cluster;
             }
         }
@@ -157,14 +175,15 @@ fn merge_kubeconfigs(
     // Merge users.
     let mut merged_users = main.users;
     for other_user in other.users {
-        let existing_users_index = merged_users
-            .iter()
-            .position(|e| e.name == other_user.name);
+        let existing_users_index = merged_users.iter().position(|e| e.name == other_user.name);
         if existing_users_index.is_none() {
             merged_users.push(other_user);
         } else if let Some(existing_users_index) = existing_users_index {
             if force {
-                warn!("Overriding user with name {} because of --force flag.", other_user.name);
+                warn!(
+                    "Overriding user with name {} because of --force flag.",
+                    other_user.name
+                );
                 merged_users[existing_users_index] = other_user;
             }
         }
@@ -182,7 +201,10 @@ fn merge_kubeconfigs(
             merged_contexts.push(other_context);
         } else if let Some(existing_contexts_index) = existing_contexts_index {
             if force {
-                warn!("Overriding context with name {} because of --force flag.", other_context.name);
+                warn!(
+                    "Overriding context with name {} because of --force flag.",
+                    other_context.name
+                );
                 merged_contexts[existing_contexts_index] = other_context;
             }
         }
@@ -200,7 +222,10 @@ fn merge_kubeconfigs(
             merged_extensions.push(other_extension);
         } else if let Some(existing_extensions_index) = existing_extensions_index {
             if force {
-                warn!("Overriding extension with name {} because of --force flag.", other_extension.name);
+                warn!(
+                    "Overriding extension with name {} because of --force flag.",
+                    other_extension.name
+                );
                 merged_extensions[existing_extensions_index] = other_extension;
             }
         }
@@ -241,13 +266,77 @@ fn main() {
                 ),
             };
 
-            let merged_kubeconfig =
-                merge_kubeconfigs(kubeconfig, other_kubeconfig, force, include_preferences);
+            match merge_kubeconfigs(kubeconfig, other_kubeconfig, force, include_preferences) {
+                Ok(merged_kubeconfig) => {
+                    info!("Writing merged kubeconfig to original given kubeconfig location.");
 
-            info!("Writing merged kubeconfig to original given kubeconfig location.");
-            println!("{}", serde_yaml::to_string(&merged_kubeconfig.ok()).ok().unwrap())
-        }
-        _ => {}
+                    match serde_yaml::to_string(&merged_kubeconfig) {
+                        Ok(merged_kubeconfig_yaml) => {
+                            match fs::write(&args.config, merged_kubeconfig_yaml) {
+                                Ok(()) => {
+                                    // Done.
+                                }
+                                Err(error) => {
+                                    panic!(
+                                        "Writing merged kubeconfig yaml failed with error: {}",
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            panic!(
+                                "Converting merged kubeconfig to yaml failed with error: {}",
+                                error
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    panic!("Merging failed with error: {:?}", error);
+                }
+            }
+        },
+        Commands::List { long } => {
+            let mut context_namespaces: Vec<PrettyPrintedContextNamespace> = vec![];
+
+            let current_context = kubeconfig.current_context.unwrap_or("".to_string());
+            let mut current_context_index = 0;
+            let mut iterator = 0;
+            for context in kubeconfig.contexts {
+                let mut context_name = context.name;
+                let mut context_namespace_name = context.context.namespace.unwrap_or("default".to_string());
+                if context_name == current_context {
+                    if !long {
+                        context_name = context_name.yellow().on_black().to_string();
+                        context_namespace_name = context_namespace_name.yellow().on_black().to_string();
+                    }
+
+                    current_context_index = iterator;
+                }
+
+                if long {
+                    context_namespaces.push(PrettyPrintedContextNamespace { CONTEXT: context_name.to_string(), NAMESPACE: context_namespace_name.to_string() });
+                } else {
+                    println!("{}", context_name);
+                }
+
+                iterator += 1;
+            }
+
+            if long {
+                let mut table = Table::new(context_namespaces);
+                table.with(Style::blank());
+                // Plus one because of the header.
+                table.modify(Rows::one(current_context_index + 1), Color::BG_BLACK | Color::FG_YELLOW);
+                // table.with(Padding::zero());
+                table.modify(Columns::first(), Padding::zero());
+
+                // Print the table.
+                println!("{}", table.to_string());
+            }
+        },
+        _ => {},
     }
 
     // for _ in 0..args.count {
