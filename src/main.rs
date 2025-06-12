@@ -1,11 +1,18 @@
 use clap::{Parser, Subcommand};
-use std::{env::home_dir, thread::current, vec};
+use std::{env::home_dir, io::Read, path::PathBuf, vec};
 mod kubeconfig;
-use crate::kubeconfig::{KubeConfig, Preferences};
-use log::{info, warn};
-use std::fs;
+use crate::kubeconfig::{KubeConfig, NamedCluster, NamedContext, NamedUser, Preferences};
 use colored::Colorize;
-use tabled::{settings::{object::{Columns, Rows}, Color, Margin, Padding, Style}, Table, Tabled};
+use log::{info, warn};
+use regex::Regex;
+use std::fs;
+use tabled::{
+    Table, Tabled,
+    settings::{
+        Color, Padding, Style,
+        object::{Columns, Rows},
+    },
+};
 
 fn default_kubeconfig_path() -> std::path::PathBuf {
     let p = home_dir().unwrap();
@@ -44,6 +51,10 @@ enum Commands {
         #[arg(short, long, default_value_t = false)]
         force: bool,
 
+        /// Only print the resulting merged kubeconfig file and do not write it to disk.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
         /// Merge preferences from the given other kubeconfig.
         #[arg(long, default_value_t = false)]
         include_preferences: bool,
@@ -54,6 +65,32 @@ enum Commands {
         /// Include the currently selected namespace.
         #[arg(short, long, default_value_t = false)]
         long: bool,
+    },
+
+    /// Rename a context, cluster or user gracefully.
+    Rename {
+        /// Rename a context from one value to the other. Syntax is previous value and new value separated by double colon.
+        /// e.g.: previous-context-name::new-context-name
+        #[arg(long)]
+        context: Option<String>,
+
+        /// Rename a cluster from one value to the other. Syntax is previous value and new value separated by double colon.
+        /// e.g.: previous-cluster-name::new-cluster-name
+        #[arg(long)]
+        cluster: Option<String>,
+
+        /// Rename a user from one value to the other. Syntax is previous value and new value separated by double colon.
+        /// e.g.: previous-user-name::new-user-name
+        #[arg(long)]
+        user: Option<String>,
+
+        /// Only print the resulting edited kubeconfig file and do not write it to disk.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Rename to new value even if there is an existing cluster/context/user with the given value.
+        #[arg(short, long, default_value_t = false)]
+        force: bool,
     },
 
     /// Delete the given cluster in the kubeconfig.
@@ -146,8 +183,8 @@ fn merge_kubeconfigs(
                         main.preferences = Some(other_preferences);
                     }
                 }
-            },
-            None => {},
+            }
+            None => {}
         }
     }
 
@@ -236,6 +273,262 @@ fn merge_kubeconfigs(
     return Ok(main);
 }
 
+fn rename_kubeconfig_values(
+    kubeconfig: KubeConfig,
+    context: Option<String>,
+    cluster: Option<String>,
+    user: Option<String>,
+    force: bool,
+) -> KubeConfig {
+    let mut kubeconfig = kubeconfig;
+
+    if let Some(context) = context {
+        let splitted_context: Vec<&str> = context.split("::").collect();
+        if splitted_context.len() != 2 {
+            panic!("`--context` needs to be in the syntax previous-value::new-value.")
+        }
+
+        let previous_value = splitted_context[0];
+        let new_value = splitted_context[1];
+
+        // Regex to check new value. We don't care about previous as we are replacing it anyways.
+        // See https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#:~:text=DNS%20Subdomain%20Names,end%20with%20an%20alphanumeric%20character
+        let regex = Regex::new(r"^([a-z0-9]{1})([a-z0-9\-\.]{0,251})([a-z0-9]{1})$").unwrap();
+        if regex.captures(new_value).is_none() {
+            panic!(
+                "`--context` new value is not a valid name for the context. should be lowercase alphanumeric including hyphens and dots, start and end with alphanumeric only and be max. 253 characters long."
+            );
+        }
+
+        // Find context with the new value, only start renaming if force in those cases.
+        // kubeconfig file will be invalid if there are duplicates, so make sure force flag is set before doing this.
+        if kubeconfig
+            .contexts
+            .iter()
+            .find(|c| c.name == new_value)
+            .is_some()
+        {
+            if force {
+                warn!(
+                    "Existing context with given new context name `{}` found in kubeconfig. Still renaming because of `--force` flag. WARN: THIS WILL RESULT IN AN INVALID KUBECONFIG FILE!",
+                    new_value
+                );
+            } else {
+                panic!(
+                    "Existing context with given new context name `{}` found in kubeconfig. Refusing to rename. Add `--force` to force the rename, resulting in an invalid kubeconfig file.",
+                    new_value
+                );
+            }
+        }
+
+        let mut number_of_renames = 0;
+        let mut did_rename_current = false;
+        let mut new_contexts: Vec<NamedContext> = vec![];
+        for context in kubeconfig.contexts {
+            if context.name == previous_value {
+                let mut new_context = context;
+                new_context.name = new_value.to_string();
+                new_contexts.push(new_context);
+                number_of_renames += 1;
+            } else {
+                new_contexts.push(context);
+            }
+        }
+        kubeconfig.contexts = new_contexts;
+        if kubeconfig.current_context == Some(previous_value.to_string()) {
+            kubeconfig.current_context = Some(new_value.to_string());
+            did_rename_current = true;
+        }
+
+        info!(
+            "Renamed {} occurrences of `{}` context to `{}`",
+            number_of_renames, previous_value, new_value
+        );
+        if did_rename_current {
+            info!(
+                "Renamed current_context from `{}` to `{}`",
+                previous_value, new_value
+            );
+        }
+    }
+
+    if let Some(cluster) = cluster {
+        let splitted_cluster: Vec<&str> = cluster.split("::").collect();
+        if splitted_cluster.len() != 2 {
+            panic!("`--cluster` needs to be in the syntax previous-value::new-value.")
+        }
+
+        let previous_value = splitted_cluster[0];
+        let new_value = splitted_cluster[1];
+
+        // Regex to check new value. We don't care about previous as we are replacing it anyways.
+        // See https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#:~:text=DNS%20Subdomain%20Names,end%20with%20an%20alphanumeric%20character
+        let regex = Regex::new(r"^([a-z0-9]{1})([a-z0-9\-\.]{0,251})([a-z0-9]{1})$").unwrap();
+        if regex.captures(new_value).is_none() {
+            panic!(
+                "`--cluster` new value is not a valid name for the cluster. should be lowercase alphanumeric including hyphens and dots, start and end with alphanumeric only and be max. 253 characters long."
+            );
+        }
+
+        // Find cluster with the new value, only start renaming if force in those cases.
+        // kubeconfig file will be invalid if there are duplicates, so make sure force flag is set before doing this.
+        if kubeconfig
+            .clusters
+            .iter()
+            .find(|c| c.name == new_value)
+            .is_some()
+        {
+            if force {
+                warn!(
+                    "Existing cluster with given new cluster name `{}` found in kubeconfig. Still renaming because of `--force` flag. WARN: THIS WILL RESULT IN AN INVALID KUBECONFIG FILE!",
+                    new_value
+                );
+            } else {
+                panic!(
+                    "Existing cluster with given new cluster name `{}` found in kubeconfig. Refusing to rename. Add `--force` to force the rename, resulting in an invalid kubeconfig file.",
+                    new_value
+                );
+            }
+        }
+
+        let mut number_of_renames = 0;
+        let mut new_clusters: Vec<NamedCluster> = vec![];
+        for cluster in kubeconfig.clusters {
+            if cluster.name == previous_value {
+                let mut new_cluster = cluster;
+                new_cluster.name = new_value.to_string();
+                new_clusters.push(new_cluster);
+                number_of_renames += 1;
+            } else {
+                new_clusters.push(cluster);
+            }
+        }
+        kubeconfig.clusters = new_clusters;
+        let mut number_of_context_cluster_renames = 0;
+        let mut new_contexts: Vec<NamedContext> = vec![];
+        for context in kubeconfig.contexts {
+            if context.context.cluster == previous_value {
+                let mut new_context = context;
+                new_context.context.cluster = new_value.to_string();
+                new_contexts.push(new_context);
+                number_of_context_cluster_renames += 1;
+            } else {
+                new_contexts.push(context);
+            }
+        }
+        kubeconfig.contexts = new_contexts;
+
+        info!(
+            "Renamed {} occurrences of `{}` clusters to `{}`",
+            number_of_renames, previous_value, new_value
+        );
+        info!(
+            "Renamed {} occurrences of `{}` clusters in contexts to `{}`",
+            number_of_context_cluster_renames, previous_value, new_value
+        );
+    }
+
+    if let Some(user) = user {
+        let splitted_user: Vec<&str> = user.split("::").collect();
+        if splitted_user.len() != 2 {
+            panic!("`--user` needs to be in the syntax previous-value::new-value.")
+        }
+
+        let previous_value = splitted_user[0];
+        let new_value = splitted_user[1];
+
+        // Regex to check new value. We don't care about previous as we are replacing it anyways.
+        // See https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#:~:text=DNS%20Subdomain%20Names,end%20with%20an%20alphanumeric%20character
+        let regex = Regex::new(r"^([a-z0-9]{1})([a-z0-9\-\.]{0,251})([a-z0-9]{1})$").unwrap();
+        if regex.captures(new_value).is_none() {
+            panic!(
+                "`--cluster` new value is not a valid name for the cluster. should be lowercase alphanumeric including hyphens and dots, start and end with alphanumeric only and be max. 253 characters long."
+            );
+        }
+
+        // Find cluster with the new value, only start renaming if force in those cases.
+        // kubeconfig file will be invalid if there are duplicates, so make sure force flag is set before doing this.
+        if kubeconfig
+            .users
+            .iter()
+            .find(|c| c.name == new_value)
+            .is_some()
+        {
+            if force {
+                warn!(
+                    "Existing user with given new user name `{}` found in kubeconfig. Still renaming because of `--force` flag. WARN: THIS WILL RESULT IN AN INVALID KUBECONFIG FILE!",
+                    new_value
+                );
+            } else {
+                panic!(
+                    "Existing user with given new user name `{}` found in kubeconfig. Refusing to rename. Add `--force` to force the rename, resulting in an invalid kubeconfig file.",
+                    new_value
+                );
+            }
+        }
+
+        let mut number_of_renames = 0;
+        let mut new_users: Vec<NamedUser> = vec![];
+        for user in kubeconfig.users {
+            if user.name == previous_value {
+                let mut new_user = user;
+                new_user.name = new_value.to_string();
+                new_users.push(new_user);
+                number_of_renames += 1;
+            } else {
+                new_users.push(user);
+            }
+        }
+        kubeconfig.users = new_users;
+        let mut number_of_context_cluster_renames = 0;
+        let mut new_contexts: Vec<NamedContext> = vec![];
+        for context in kubeconfig.contexts {
+            if context.context.user == previous_value {
+                let mut new_context = context;
+                new_context.context.user = new_value.to_string();
+                new_contexts.push(new_context);
+                number_of_context_cluster_renames += 1;
+            } else {
+                new_contexts.push(context);
+            }
+        }
+        kubeconfig.contexts = new_contexts;
+
+        info!(
+            "Renamed {} occurrences of `{}` users to `{}`",
+            number_of_renames, previous_value, new_value
+        );
+        info!(
+            "Renamed {} occurrences of `{}` users in contexts to `{}`",
+            number_of_context_cluster_renames, previous_value, new_value
+        );
+    }
+
+    return kubeconfig;
+}
+
+fn write_kubeconfig(path: PathBuf, kubeconfig: KubeConfig, dry_run: bool) {
+    match serde_yaml::to_string(&kubeconfig) {
+        Ok(merged_kubeconfig_yaml) => {
+            if dry_run {
+                println!("{}", merged_kubeconfig_yaml);
+            } else {
+                match fs::write(&path, merged_kubeconfig_yaml) {
+                    Ok(()) => {
+                        // Done.
+                    }
+                    Err(error) => {
+                        panic!("Writing kubeconfig yaml failed with error: {}", error);
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            panic!("Converting kubeconfig to yaml failed with error: {}", error);
+        }
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -256,47 +549,61 @@ fn main() {
             other,
             force,
             include_preferences,
+            dry_run,
         } => {
-            let other_kubeconfig = match KubeConfig::from_file(&other) {
-                Ok(k) => k,
-                Err(e) => panic!(
-                    "Other kubeconfig (to merge) with path: {} - could not be verified due to error: {}",
-                    other.display(),
-                    e
-                ),
-            };
+            let mut other_kubeconfig: Option<KubeConfig> = None;
+            if let Some(path) = other.clone().into_os_string().to_str() {
+                if path == "-" {
+                    // Read from stdin.
+                    let mut buffer = Vec::new();
+                    let stdin = std::io::stdin();
+                    let mut handle = stdin.lock();
+                    match handle.read_to_end(&mut buffer) {
+                        Ok(_size) => {
+                            let s = match str::from_utf8(&buffer) {
+                                Ok(v) => v,
+                                Err(e) => panic!("invalid utf8 sequence in stdin: {}", e),
+                            };
+
+                            other_kubeconfig = match KubeConfig::from_yaml(s) {
+                                Ok(k) => Some(k),
+                                Err(e) => panic!(
+                                    "Other kubeconfig (to merge) from stdin - could not be verified due to error: {}",
+                                    e
+                                ),
+                            }
+                        },
+                        Err(e) => {
+                            panic!("error while reading stdin: {}", e);
+                        }
+                    }
+                }
+            }
+
+            if other_kubeconfig.is_none() {
+                other_kubeconfig = match KubeConfig::from_file(&other) {
+                    Ok(k) => Some(k),
+                    Err(e) => panic!(
+                        "Other kubeconfig (to merge) with path: {} - could not be verified due to error: {}",
+                        other.display(),
+                        e
+                    ),
+                };
+            }
+
+            let other_kubeconfig = other_kubeconfig.unwrap();
 
             match merge_kubeconfigs(kubeconfig, other_kubeconfig, force, include_preferences) {
                 Ok(merged_kubeconfig) => {
                     info!("Writing merged kubeconfig to original given kubeconfig location.");
 
-                    match serde_yaml::to_string(&merged_kubeconfig) {
-                        Ok(merged_kubeconfig_yaml) => {
-                            match fs::write(&args.config, merged_kubeconfig_yaml) {
-                                Ok(()) => {
-                                    // Done.
-                                }
-                                Err(error) => {
-                                    panic!(
-                                        "Writing merged kubeconfig yaml failed with error: {}",
-                                        error
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            panic!(
-                                "Converting merged kubeconfig to yaml failed with error: {}",
-                                error
-                            );
-                        }
-                    }
+                    write_kubeconfig(args.config, merged_kubeconfig, dry_run);
                 }
                 Err(error) => {
                     panic!("Merging failed with error: {:?}", error);
                 }
             }
-        },
+        }
         Commands::List { long } => {
             let mut context_namespaces: Vec<PrettyPrintedContextNamespace> = vec![];
 
@@ -305,18 +612,23 @@ fn main() {
             let mut iterator = 0;
             for context in kubeconfig.contexts {
                 let mut context_name = context.name;
-                let mut context_namespace_name = context.context.namespace.unwrap_or("default".to_string());
+                let mut context_namespace_name =
+                    context.context.namespace.unwrap_or("default".to_string());
                 if context_name == current_context {
                     if !long {
                         context_name = context_name.yellow().on_black().to_string();
-                        context_namespace_name = context_namespace_name.yellow().on_black().to_string();
+                        context_namespace_name =
+                            context_namespace_name.yellow().on_black().to_string();
                     }
 
                     current_context_index = iterator;
                 }
 
                 if long {
-                    context_namespaces.push(PrettyPrintedContextNamespace { CONTEXT: context_name.to_string(), NAMESPACE: context_namespace_name.to_string() });
+                    context_namespaces.push(PrettyPrintedContextNamespace {
+                        CONTEXT: context_name.to_string(),
+                        NAMESPACE: context_namespace_name.to_string(),
+                    });
                 } else {
                     println!("{}", context_name);
                 }
@@ -328,15 +640,30 @@ fn main() {
                 let mut table = Table::new(context_namespaces);
                 table.with(Style::blank());
                 // Plus one because of the header.
-                table.modify(Rows::one(current_context_index + 1), Color::BG_BLACK | Color::FG_YELLOW);
+                table.modify(
+                    Rows::one(current_context_index + 1),
+                    Color::BG_BLACK | Color::FG_YELLOW,
+                );
                 // table.with(Padding::zero());
                 table.modify(Columns::first(), Padding::zero());
 
                 // Print the table.
                 println!("{}", table.to_string());
             }
-        },
-        _ => {},
+        }
+        Commands::Rename {
+            context,
+            cluster,
+            user,
+            dry_run,
+            force,
+        } => {
+            let new_kubeconfig =
+                rename_kubeconfig_values(kubeconfig, context, cluster, user, force);
+
+            write_kubeconfig(args.config, new_kubeconfig, dry_run);
+        }
+        _ => {}
     }
 
     // for _ in 0..args.count {
