@@ -1,5 +1,11 @@
 use clap::{Parser, Subcommand};
-use std::{env::home_dir, io::Read, path::PathBuf, vec};
+use std::{
+    env::home_dir,
+    io::{Read, Write, stdin, stdout},
+    path::PathBuf,
+    process::exit,
+    vec,
+};
 mod kubeconfig;
 use crate::kubeconfig::{KubeConfig, NamedCluster, NamedContext, NamedUser, Preferences};
 use colored::Colorize;
@@ -84,6 +90,12 @@ enum Commands {
         #[arg(long)]
         user: Option<String>,
 
+        /// Rename a context, cluster and user from one value to the other. Syntax is previous value and new value separated by double colon.
+        /// e.g.: previous-user-name::new-user-name
+        /// NOTE: `--context`, `--cluster` and `--user` are ignored if this is provided.
+        #[arg(long)]
+        all: Option<String>,
+
         /// Only print the resulting edited kubeconfig file and do not write it to disk.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -95,9 +107,13 @@ enum Commands {
 
     /// Delete the given cluster in the kubeconfig.
     Delete {
-        /// The cluster name to delete from the kubeconfig.
+        /// The context name to delete from the kubeconfig.
         #[arg(short, long)]
-        cluster: String,
+        context: String,
+
+        /// Only print the resulting edited kubeconfig file and do not write it to disk.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
 
         /// Skip interactive confirmation.
         #[arg(short, long, default_value_t = false)]
@@ -278,9 +294,19 @@ fn rename_kubeconfig_values(
     context: Option<String>,
     cluster: Option<String>,
     user: Option<String>,
+    all: Option<String>,
     force: bool,
 ) -> KubeConfig {
     let mut kubeconfig = kubeconfig;
+
+    let mut context = context;
+    let mut cluster = cluster;
+    let mut user = user;
+    if let Some(all) = all {
+        context = Some(all.clone());
+        cluster = Some(all.clone());
+        user = Some(all.clone());
+    }
 
     if let Some(context) = context {
         let splitted_context: Vec<&str> = context.split("::").collect();
@@ -507,6 +533,77 @@ fn rename_kubeconfig_values(
     return kubeconfig;
 }
 
+fn delete_context(kubeconfig: KubeConfig, context: String, yes: bool) -> KubeConfig {
+    let old_number_of_contexts = kubeconfig.contexts.len();
+    let old_number_of_clusters = kubeconfig.clusters.len();
+    let old_number_of_users = kubeconfig.users.len();
+
+    let mut kubeconfig = kubeconfig;
+
+    let mut new_contexts: Vec<NamedContext> = vec![];
+    let mut cluster_names_to_delete: Vec<String> = vec![];
+    let mut user_names_to_delete: Vec<String> = vec![];
+    for context_to_check in kubeconfig.contexts {
+        if context_to_check.name == context {
+            cluster_names_to_delete.push(context_to_check.context.cluster);
+            user_names_to_delete.push(context_to_check.context.user);
+        } else {
+            new_contexts.push(context_to_check);
+        }
+    }
+    kubeconfig.contexts = new_contexts;
+    if kubeconfig.current_context == Some(context) {
+        kubeconfig.current_context = None;
+    }
+
+    let mut new_clusters: Vec<NamedCluster> = vec![];
+    for cluster_to_check in kubeconfig.clusters {
+        if cluster_names_to_delete
+            .iter()
+            .find(|c| **c == cluster_to_check.name)
+            .is_none()
+        {
+            new_clusters.push(cluster_to_check);
+        }
+    }
+    kubeconfig.clusters = new_clusters;
+
+    let mut new_users: Vec<NamedUser> = vec![];
+    for user_to_check in kubeconfig.users {
+        if user_names_to_delete
+            .iter()
+            .find(|c| **c == user_to_check.name)
+            .is_none()
+        {
+            new_users.push(user_to_check);
+        }
+    }
+    kubeconfig.users = new_users;
+
+    if !yes {
+        let mut s = String::new();
+        println!(
+            "This action is going to delete {} contexts, {} clusters and {} users.",
+            old_number_of_contexts - kubeconfig.contexts.len(),
+            old_number_of_clusters - kubeconfig.clusters.len(),
+            old_number_of_users - kubeconfig.users.len(),
+        );
+        print!("Are you sure you want to continue? (y/n) ");
+        let _ = stdout().flush();
+        stdin()
+            .read_line(&mut s)
+            .expect("User input broken. Please try again.");
+
+        if s.trim().to_lowercase() != "y" {
+            // Terminate program.
+            println!("User cancelled deleting the context.");
+            exit(1);
+        }
+    }
+
+    return kubeconfig;
+}
+
 fn write_kubeconfig(path: PathBuf, kubeconfig: KubeConfig, dry_run: bool) {
     match serde_yaml::to_string(&kubeconfig) {
         Ok(merged_kubeconfig_yaml) => {
@@ -572,7 +669,7 @@ fn main() {
                                     e
                                 ),
                             }
-                        },
+                        }
                         Err(e) => {
                             panic!("error while reading stdin: {}", e);
                         }
@@ -655,15 +752,24 @@ fn main() {
             context,
             cluster,
             user,
+            all,
             dry_run,
             force,
         } => {
             let new_kubeconfig =
-                rename_kubeconfig_values(kubeconfig, context, cluster, user, force);
+                rename_kubeconfig_values(kubeconfig, context, cluster, user, all, force);
 
             write_kubeconfig(args.config, new_kubeconfig, dry_run);
         }
-        _ => {}
+        Commands::Delete {
+            context,
+            dry_run,
+            yes,
+        } => {
+            let new_kubeconfig = delete_context(kubeconfig, context, dry_run || yes);
+
+            write_kubeconfig(args.config, new_kubeconfig, dry_run);
+        }
     }
 
     // for _ in 0..args.count {
